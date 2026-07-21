@@ -1,0 +1,25 @@
+{
+  "name": "auric-reddit-watcher",
+  "version": "1.0.0",
+  "description": "Watches configured subreddits and flags new posts worth commenting on to promote Auric.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^20.14.9",
+    "tsx": "^4.19.1",
+    "typescript": "^5.5.4"
+  },
+  "allowScripts": {
+    "better-sqlite3@11.10.0": true,
+    "esbuild@0.28.1": true
+  }
+}
