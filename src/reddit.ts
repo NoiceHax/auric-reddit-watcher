@@ -44,18 +44,80 @@ async function getAccessToken(): Promise<string> {
   return cachedToken.token;
 }
 
-export async function fetchNewPosts(subreddit: string, limit: number): Promise<RedditPost[]> {
-  const token = await getAccessToken();
+// Headers that mimic a normal browser request, so this traffic blends in with a
+// person browsing/commenting Reddit at the same time.
+function browserHeaders(): Record<string, string> {
+  return {
+    "User-Agent": config.reddit.userAgent,
+    Accept: "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9",
+  };
+}
 
-  const res = await fetch(
+// Node's fetch has no cookie jar. Reddit blocks unauthenticated JSON requests
+// that arrive with no cookies, so we prime a session against old.reddit.com to
+// pick up its Set-Cookie values, then replay them (plus a browser UA) on each
+// JSON request — the same trick as a requests.Session with a warm-up GET.
+let sessionCookie = "";
+
+async function primeSession(): Promise<void> {
+  try {
+    const res = await fetch("https://old.reddit.com/", {
+      headers: browserHeaders(),
+    });
+    const cookies = res.headers
+      .getSetCookie()
+      .map((c) => c.split(";")[0]) // keep only name=value, drop attributes
+      .filter(Boolean);
+    if (cookies.length) {
+      sessionCookie = cookies.join("; ");
+    }
+    // Drain the body so the connection is released.
+    await res.text();
+  } catch {
+    // Best-effort — if priming fails we still try the request; it may re-prime.
+  }
+}
+
+async function fetchPublicOnce(subreddit: string, limit: number): Promise<Response> {
+  const headers = browserHeaders();
+  if (sessionCookie) headers.Cookie = sessionCookie;
+  // old.reddit.com is far less aggressive about blocking than www.
+  return fetch(
+    `https://old.reddit.com/r/${subreddit}/new.json?limit=${limit}&raw_json=1`,
+    { headers }
+  );
+}
+
+async function fetchPublic(subreddit: string, limit: number): Promise<Response> {
+  if (!sessionCookie) await primeSession();
+
+  let res = await fetchPublicOnce(subreddit, limit);
+  // If we get blocked, the cookie is likely stale/missing — re-prime once and retry.
+  if (res.status === 403 || res.status === 429) {
+    await primeSession();
+    res = await fetchPublicOnce(subreddit, limit);
+  }
+  return res;
+}
+
+async function fetchOAuth(subreddit: string, limit: number): Promise<Response> {
+  const token = await getAccessToken();
+  return fetch(
     `https://oauth.reddit.com/r/${subreddit}/new?limit=${limit}&raw_json=1`,
     {
       headers: {
+        ...browserHeaders(),
         Authorization: `Bearer ${token}`,
-        "User-Agent": config.reddit.userAgent,
       },
     }
   );
+}
+
+export async function fetchNewPosts(subreddit: string, limit: number): Promise<RedditPost[]> {
+  const res = config.reddit.usePublicApi
+    ? await fetchPublic(subreddit, limit)
+    : await fetchOAuth(subreddit, limit);
 
   if (!res.ok) {
     throw new Error(`Failed to fetch r/${subreddit}: ${res.status} ${await res.text()}`);
