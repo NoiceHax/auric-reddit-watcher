@@ -9,6 +9,15 @@ export interface RedditPost {
   url: string;
   permalink: string;
   created_utc: number;
+  stickied?: boolean;
+}
+
+// Query string for the configured listing ("new", "hot", or "top?t=day").
+function listingQuery(limit: number): string {
+  const params = `limit=${limit}&raw_json=1`;
+  return config.redditListing === "top"
+    ? `${params}&t=${config.redditTopTime}`
+    : params;
 }
 
 let cachedToken: { token: string; expiresAt: number } | null = null;
@@ -84,7 +93,7 @@ async function fetchPublicOnce(subreddit: string, limit: number): Promise<Respon
   if (sessionCookie) headers.Cookie = sessionCookie;
   // old.reddit.com is far less aggressive about blocking than www.
   return fetch(
-    `https://old.reddit.com/r/${subreddit}/new.json?limit=${limit}&raw_json=1`,
+    `https://old.reddit.com/r/${subreddit}/${config.redditListing}.json?${listingQuery(limit)}`,
     { headers }
   );
 }
@@ -104,7 +113,7 @@ async function fetchPublic(subreddit: string, limit: number): Promise<Response> 
 async function fetchOAuth(subreddit: string, limit: number): Promise<Response> {
   const token = await getAccessToken();
   return fetch(
-    `https://oauth.reddit.com/r/${subreddit}/new?limit=${limit}&raw_json=1`,
+    `https://oauth.reddit.com/r/${subreddit}/${config.redditListing}?${listingQuery(limit)}`,
     {
       headers: {
         ...browserHeaders(),
@@ -129,5 +138,6 @@ export async function fetchNewPosts(subreddit: string, limit: number): Promise<R
 
   return data.data.children
     .map((child) => child.data)
+    .filter((post) => !post.stickied) // hot/top listings include pinned mod posts
     .sort((a, b) => a.created_utc - b.created_utc);
 }

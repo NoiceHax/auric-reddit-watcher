@@ -16,7 +16,10 @@ async function pollSubreddit(subreddit: string): Promise<void> {
   const posts = await fetchNewPosts(subreddit, config.postsPerPoll);
   const unseen = posts.filter((post) => !hasSeen(post.id));
 
-  if (!isPrimed(subreddit)) {
+  // Priming only applies to the "new" listing: there the startup backlog is
+  // noise. For "hot"/"top" the current listing IS the content we want to
+  // classify, so we process it from the very first poll.
+  if (config.redditListing === "new" && !isPrimed(subreddit)) {
     // First time seeing this subreddit: record the current front page as a
     // baseline without notifying, so startup doesn't dump a backlog of alerts.
     for (const post of unseen) {

@@ -57,6 +57,10 @@ export const config = {
   discordWebhookUrl: required("DISCORD_WEBHOOK_URL"),
   pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 300),
   postsPerPoll: Number(process.env.POSTS_PER_POLL ?? 25),
+  // Which listing to poll: "new" (default), "hot", or "top".
+  // "top" is scoped by redditTopTime (hour/day/week/month/year/all).
+  redditListing: (process.env.REDDIT_LISTING ?? "new") as "new" | "hot" | "top",
+  redditTopTime: process.env.REDDIT_TOP_TIME ?? "day",
   classifierModel: process.env.CLASSIFIER_MODEL ?? "meta/llama-3.1-8b-instruct",
   classifyTimeoutMs: Number(process.env.CLASSIFY_TIMEOUT_MS ?? 30000),
   subreddits: subredditsFile.subreddits,
