@@ -77,24 +77,42 @@ export async function classifyPost(post: RedditPost): Promise<ClassificationResu
 Title: ${post.title}
 Body: ${post.selftext?.slice(0, 2000) || "(no body / link post)"}`;
 
-  const res = await fetch(`${config.nvidia.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${config.nvidia.apiKey}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: config.classifierModel,
-      temperature: 0.2,
-      max_tokens: 300,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userContent },
-      ],
-      tools: [TOOL_SCHEMA],
-      tool_choice: { type: "function", function: { name: "classify_post" } },
-    }),
-  });
+  // Bound the request so a stalled/unavailable model errors (and gets caught and
+  // logged per-post) instead of hanging the whole poll loop indefinitely.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), config.classifyTimeoutMs);
+
+  let res: Response;
+  try {
+    res = await fetch(`${config.nvidia.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.nvidia.apiKey}`,
+        "content-type": "application/json",
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: config.classifierModel,
+        temperature: 0.2,
+        max_tokens: 300,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userContent },
+        ],
+        tools: [TOOL_SCHEMA],
+        tool_choice: { type: "function", function: { name: "classify_post" } },
+      }),
+    });
+  } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      throw new Error(
+        `Classification timed out after ${config.classifyTimeoutMs}ms (model: ${config.classifierModel})`
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!res.ok) {
     throw new Error(`Classification request failed: ${res.status} ${await res.text()}`);

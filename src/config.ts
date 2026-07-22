@@ -57,6 +57,7 @@ export const config = {
   discordWebhookUrl: required("DISCORD_WEBHOOK_URL"),
   pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 300),
   postsPerPoll: Number(process.env.POSTS_PER_POLL ?? 25),
-  classifierModel: process.env.CLASSIFIER_MODEL ?? "meta/llama-3.3-70b-instruct",
+  classifierModel: process.env.CLASSIFIER_MODEL ?? "meta/llama-3.1-8b-instruct",
+  classifyTimeoutMs: Number(process.env.CLASSIFY_TIMEOUT_MS ?? 30000),
   subreddits: subredditsFile.subreddits,
 };
