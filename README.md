@@ -1,27 +1,48 @@
 # Auric Reddit Watcher
 
 Watches a configurable list of subreddits, uses an NVIDIA NIM-hosted LLM to flag new posts that
-are a genuine opportunity to mention [Auric](https://auric.cx), and posts the link + reasoning to
-a Discord channel. It never posts to Reddit itself — a human reviews and comments manually.
+are a genuine opportunity to mention [Auric](https://auric.cx), and turns the **author** of each
+such post into a lead: it stores the person in Postgres and posts a Discord alert with a link to
+their profile and a pre-filled compose-DM link. It never posts to Reddit itself — a human reviews
+each lead and sends the DM manually.
 
 ## How it works
 
 1. Every `POLL_INTERVAL_SECONDS`, it fetches the newest posts from each subreddit in
-   `config/subreddits.json` via Reddit's OAuth API.
-2. New post IDs are recorded in a local SQLite DB (`data/watcher.db`) so nothing is processed
-   twice, even across restarts.
-3. The first poll for a subreddit only "primes" the baseline (records existing posts) without
-   notifying, so you don't get a backlog dump on first run.
-4. Each new post is sent to an NVIDIA NIM model with a rubric describing Auric and what makes a
-   post worth commenting on. If it's a match, the post link + reasoning is sent to your Discord
-   webhook.
+   `config/subreddits.json` (public browser-session mode by default; OAuth optional).
+2. Dedup state (seen post IDs, primed subreddits) and the `leads` table live in **Neon Postgres**
+   (`DATABASE_URL`). Tables are created automatically on startup. Nothing is processed twice, even
+   across restarts or hosts.
+3. The first poll for a subreddit (in `new` listing mode) only "primes" the baseline without
+   capturing leads, so you don't get a backlog dump on first run.
+4. Each new post is classified by an NVIDIA NIM model against a rubric describing Auric. If it's a
+   match, the post's author is upserted into the `leads` table.
+5. **A Discord alert fires only for a brand-new lead** — deduped by Reddit username, so a prolific
+   author is captured (and pinged) exactly once. The alert centers on the person (profile link +
+   compose-DM link), not the full post; the triggering post is linked for context.
+
+## The `leads` table
+
+| column             | notes                                             |
+| ------------------ | ------------------------------------------------- |
+| `username`         | primary key — Reddit author, deduped              |
+| `subreddit`        | where the triggering post was found               |
+| `post_id`          | Reddit post id                                    |
+| `post_title`       | title of the triggering post                      |
+| `post_permalink`   | permalink path of the triggering post             |
+| `post_created_utc` | post creation time (unix seconds)                 |
+| `reason`           | the classifier's rationale                        |
+| `status`           | workflow status, defaults to `new`                |
+| `created_at`       | when the lead was captured                        |
+
+Track outreach by updating `status` (e.g. `new` → `dm_sent` → `replied`) yourself in Postgres.
 
 ## Setup
 
-### 1. Reddit API credentials
+### 1. Postgres (Neon)
 
-- Go to https://www.reddit.com/prefs/apps → "create another app" → type **script**.
-- Note the client ID (under the app name) and client secret.
+- Create a database at https://neon.tech and copy its connection string into `DATABASE_URL`.
+- No manual migration needed — tables are created on first run.
 
 ### 2. Discord webhook
 
@@ -35,24 +56,19 @@ a Discord channel. It never posts to Reddit itself — a human reviews and comme
 
 ```
 cp .env.example .env
-# fill in REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT,
-# NVIDIA_API_KEY, DISCORD_WEBHOOK_URL
+# fill in DATABASE_URL, NVIDIA_API_KEY, DISCORD_WEBHOOK_URL
+# (Reddit creds only needed if REDDIT_USE_PUBLIC=false)
 ```
 
-Edit `config/subreddits.json` to change which subreddits are watched — no rebuild needed if
-running via Docker with the volume mount below, just restart the container.
+Edit `config/subreddits.json` to change which subreddits are watched.
 
-## Run on the laptop (Docker)
+## Run (Docker)
 
 ```
 docker compose up -d --build
 ```
 
-- `restart: unless-stopped` in `docker-compose.yml` means it survives crashes and reboots as long
-  as Docker itself starts on boot. On Linux, enable that once with:
-  ```
-  sudo systemctl enable docker
-  ```
+- `restart: unless-stopped` means it survives crashes and reboots as long as Docker starts on boot.
 - Logs: `docker compose logs -f`
 - Update after editing `config/subreddits.json`: `docker compose restart`
 - Update after code changes: `docker compose up -d --build`
@@ -66,11 +82,13 @@ npm run dev
 
 ## Notes / tuning
 
-- Default poll interval is 5 minutes across 7 subreddits — well within Reddit's and NVIDIA NIM's
-  rate limits. Increase `POLL_INTERVAL_SECONDS` if you add many more subreddits.
-- `CLASSIFIER_MODEL` defaults to `meta/llama-3.3-70b-instruct`; swap to any other NIM model that
-  supports tool calling by setting `CLASSIFIER_MODEL` in `.env` (browse models at
-  https://build.nvidia.com/). If a model doesn't support tool calling, `classify.ts` falls back
-  to parsing a raw JSON object from its response.
-- To reset and re-scan everything (e.g. after changing the classification rubric), stop the
-  container and delete `data/watcher.db`.
+- Default poll interval is 5 minutes — well within Reddit's and NVIDIA NIM's rate limits. Increase
+  `POLL_INTERVAL_SECONDS` if you add many more subreddits.
+- `CLASSIFIER_MODEL` defaults to `meta/llama-3.1-8b-instruct` (fast and reliable on NIM's free
+  tier; the 70b models frequently stall there). Swap to any other tool-calling NIM model via
+  `.env`. If a model doesn't support tool calling, `classify.ts` falls back to parsing a raw JSON
+  object from its response.
+- To reset and re-scan everything (e.g. after changing the rubric), `TRUNCATE seen_posts,
+  primed_subreddits` in Postgres. To clear captured people, `TRUNCATE leads`.
+- Auto-sending Reddit DMs is intentionally **not** done here — it requires an authenticated Reddit
+  account and risks ToS/spam bans. This tool collects and surfaces leads for manual outreach.

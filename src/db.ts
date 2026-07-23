@@ -1,50 +1,98 @@
-import Database from "better-sqlite3";
-import path from "node:path";
-import fs from "node:fs";
+import { Pool } from "pg";
+import { config } from "./config";
+import type { RedditPost } from "./reddit";
+import type { ClassificationResult } from "./classify";
 
-const dataDir = path.join(__dirname, "..", "data");
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+// Single Neon Postgres pool for the whole process. Neon requires SSL; Neon's
+// certs are valid, but rejectUnauthorized:false keeps this robust across the
+// pooler endpoint / self-signed intermediates without extra CA config.
+const pool = new Pool({
+  connectionString: config.databaseUrl,
+  ssl: { rejectUnauthorized: false },
+});
+
+// Create tables on startup. Called once from index.ts before polling begins.
+export async function initDb(): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS seen_posts (
+      id TEXT PRIMARY KEY,
+      subreddit TEXT NOT NULL,
+      created_utc BIGINT NOT NULL,
+      processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS primed_subreddits (
+      subreddit TEXT PRIMARY KEY,
+      primed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    -- One row per person worth reaching out to. Deduped by reddit username so a
+    -- prolific author is only ever captured (and notified) once.
+    CREATE TABLE IF NOT EXISTS leads (
+      username TEXT PRIMARY KEY,
+      subreddit TEXT NOT NULL,
+      post_id TEXT NOT NULL,
+      post_title TEXT NOT NULL,
+      post_permalink TEXT NOT NULL,
+      post_created_utc BIGINT NOT NULL,
+      reason TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'new',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
 }
 
-const db = new Database(path.join(dataDir, "watcher.db"));
-db.pragma("journal_mode = WAL");
+export async function hasSeen(postId: string): Promise<boolean> {
+  const res = await pool.query("SELECT 1 FROM seen_posts WHERE id = $1", [postId]);
+  return res.rowCount! > 0;
+}
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS seen_posts (
-    id TEXT PRIMARY KEY,
-    subreddit TEXT NOT NULL,
-    created_utc INTEGER NOT NULL,
-    processed_at INTEGER NOT NULL
+export async function markSeen(
+  postId: string,
+  subreddit: string,
+  createdUtc: number
+): Promise<void> {
+  await pool.query(
+    "INSERT INTO seen_posts (id, subreddit, created_utc) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+    [postId, subreddit, createdUtc]
   );
+}
 
-  CREATE TABLE IF NOT EXISTS primed_subreddits (
-    subreddit TEXT PRIMARY KEY,
-    primed_at INTEGER NOT NULL
+export async function isPrimed(subreddit: string): Promise<boolean> {
+  const res = await pool.query("SELECT 1 FROM primed_subreddits WHERE subreddit = $1", [
+    subreddit,
+  ]);
+  return res.rowCount! > 0;
+}
+
+export async function markPrimed(subreddit: string): Promise<void> {
+  await pool.query(
+    "INSERT INTO primed_subreddits (subreddit) VALUES ($1) ON CONFLICT (subreddit) DO NOTHING",
+    [subreddit]
   );
-`);
-
-const hasSeenStmt = db.prepare("SELECT 1 FROM seen_posts WHERE id = ?");
-const markSeenStmt = db.prepare(
-  "INSERT OR IGNORE INTO seen_posts (id, subreddit, created_utc, processed_at) VALUES (?, ?, ?, ?)"
-);
-const isPrimedStmt = db.prepare("SELECT 1 FROM primed_subreddits WHERE subreddit = ?");
-const markPrimedStmt = db.prepare(
-  "INSERT OR IGNORE INTO primed_subreddits (subreddit, primed_at) VALUES (?, ?)"
-);
-
-export function hasSeen(postId: string): boolean {
-  return hasSeenStmt.get(postId) !== undefined;
 }
 
-export function markSeen(postId: string, subreddit: string, createdUtc: number): void {
-  markSeenStmt.run(postId, subreddit, createdUtc, Date.now());
-}
-
-export function isPrimed(subreddit: string): boolean {
-  return isPrimedStmt.get(subreddit) !== undefined;
-}
-
-export function markPrimed(subreddit: string): void {
-  markPrimedStmt.run(subreddit, Date.now());
+// Record a person as a lead. Returns true only when this username was newly
+// inserted, so the caller notifies Discord exactly once per person (a later
+// worthy post from the same author is a no-op).
+export async function upsertLead(
+  post: RedditPost,
+  classification: ClassificationResult
+): Promise<boolean> {
+  const res = await pool.query(
+    `INSERT INTO leads (username, subreddit, post_id, post_title, post_permalink, post_created_utc, reason)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (username) DO NOTHING
+     RETURNING username`,
+    [
+      post.author,
+      post.subreddit,
+      post.id,
+      post.title,
+      post.permalink,
+      post.created_utc,
+      classification.reason,
+    ]
+  );
+  return res.rowCount! > 0;
 }

@@ -55,6 +55,8 @@ export const config = {
     baseUrl: process.env.NVIDIA_BASE_URL ?? "https://integrate.api.nvidia.com/v1",
   },
   discordWebhookUrl: required("DISCORD_WEBHOOK_URL"),
+  // Neon Postgres connection string — holds dedup state and the leads table.
+  databaseUrl: required("DATABASE_URL"),
   pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 300),
   postsPerPoll: Number(process.env.POSTS_PER_POLL ?? 25),
   // Which listing to poll: "new" (default), "hot", or "top".

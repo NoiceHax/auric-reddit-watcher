@@ -5,5 +5,4 @@ services:
     env_file:
       - .env
     volumes:
-      - ./data:/app/data
       - ./config:/app/config
