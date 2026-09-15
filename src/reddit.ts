@@ -1,3 +1,4 @@
+import { chromium, type BrowserContext, type Page } from "playwright";
 import { config } from "./config";
 
 export interface RedditPost {
@@ -12,127 +13,136 @@ export interface RedditPost {
   stickied?: boolean;
 }
 
+function log(message: string): void {
+  console.log(`[${new Date().toISOString()}] ${message}`);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // Query string for the configured listing ("new", "hot", or "top?t=day").
 function listingQuery(limit: number): string {
   const params = `limit=${limit}&raw_json=1`;
-  return config.redditListing === "top"
-    ? `${params}&t=${config.redditTopTime}`
-    : params;
+  return config.redditListing === "top" ? `${params}&t=${config.redditTopTime}` : params;
 }
 
-let cachedToken: { token: string; expiresAt: number } | null = null;
+let context: BrowserContext | null = null;
+let page: Page | null = null;
+// Dedicated tab for session probes, kept off the page a human may be typing on.
+let probePage: Page | null = null;
 
-async function getAccessToken(): Promise<string> {
-  if (cachedToken && cachedToken.expiresAt > Date.now() + 30_000) {
-    return cachedToken.token;
-  }
+// A persistent, headful Chrome. Reddit serves logged-out JSON requests a 302 to
+// /login regardless of User-Agent, and flags headless Chrome outright, so the
+// only durable way in is a real browser carrying a real logged-in session.
+async function ensureBrowser(): Promise<Page> {
+  if (page && !page.isClosed()) return page;
 
-  const basicAuth = Buffer.from(
-    `${config.reddit.clientId}:${config.reddit.clientSecret}`
-  ).toString("base64");
-
-  const res = await fetch("https://www.reddit.com/api/v1/access_token", {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${basicAuth}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": config.reddit.userAgent,
-    },
-    body: "grant_type=client_credentials",
+  context = await chromium.launchPersistentContext(config.browser.profileDir, {
+    headless: config.browser.headless,
+    viewport: { width: 1280, height: 900 },
+    // Only override the UA if explicitly configured; otherwise Chrome's own
+    // (genuine, self-consistent) User-Agent is used.
+    ...(config.reddit.userAgent ? { userAgent: config.reddit.userAgent } : {}),
+    args: [
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-blink-features=AutomationControlled",
+    ],
   });
 
-  if (!res.ok) {
-    throw new Error(`Reddit auth failed: ${res.status} ${await res.text()}`);
-  }
-
-  const data = (await res.json()) as { access_token: string; expires_in: number };
-  cachedToken = {
-    token: data.access_token,
-    expiresAt: Date.now() + data.expires_in * 1000,
-  };
-  return cachedToken.token;
+  page = context.pages()[0] ?? (await context.newPage());
+  page.setDefaultNavigationTimeout(config.browser.navigationTimeoutMs);
+  return page;
 }
 
-// Headers that mimic a normal browser request, so this traffic blends in with a
-// person browsing/commenting Reddit at the same time.
-function browserHeaders(): Record<string, string> {
-  return {
-    "User-Agent": config.reddit.userAgent,
-    Accept: "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "en-US,en;q=0.9",
-  };
-}
-
-// Node's fetch has no cookie jar. Reddit blocks unauthenticated JSON requests
-// that arrive with no cookies, so we prime a session against old.reddit.com to
-// pick up its Set-Cookie values, then replay them (plus a browser UA) on each
-// JSON request — the same trick as a requests.Session with a warm-up GET.
-let sessionCookie = "";
-
-async function primeSession(): Promise<void> {
+// Ground-truth login check. Probing the API beats looking for a named session
+// cookie: Reddit has renamed those before, and a stale name would report
+// "logged in" right up until every listing came back as a login page.
+//
+// Runs in its own tab, not the visible one: this is polled while a human is
+// typing into the login form, and navigating that page out from under them
+// every few seconds would wipe what they had entered.
+async function hasSession(): Promise<boolean> {
+  if (!context) return false;
   try {
-    const res = await fetch("https://old.reddit.com/", {
-      headers: browserHeaders(),
+    probePage = probePage && !probePage.isClosed() ? probePage : await context.newPage();
+    const res = await probePage.goto("https://old.reddit.com/api/me.json", {
+      waitUntil: "domcontentloaded",
+      // Bounded so a slow or hung probe cannot stall startup or the wait loop.
+      timeout: 15000,
     });
-    const cookies = res.headers
-      .getSetCookie()
-      .map((c) => c.split(";")[0]) // keep only name=value, drop attributes
-      .filter(Boolean);
-    if (cookies.length) {
-      sessionCookie = cookies.join("; ");
-    }
-    // Drain the body so the connection is released.
-    await res.text();
+    if (!res || !res.ok()) return false;
+    if (probePage.url().includes("/login")) return false;
+    const body = JSON.parse(await res.text()) as { data?: { name?: string } };
+    return !!body?.data?.name;
   } catch {
-    // Best-effort — if priming fails we still try the request; it may re-prime.
+    return false;
   }
 }
 
-async function fetchPublicOnce(subreddit: string, limit: number): Promise<Response> {
-  const headers = browserHeaders();
-  if (sessionCookie) headers.Cookie = sessionCookie;
-  // old.reddit.com is far less aggressive about blocking than www.
-  return fetch(
-    `https://old.reddit.com/r/${subreddit}/${config.redditListing}.json?${listingQuery(limit)}`,
-    { headers }
-  );
-}
+// Block startup until a human has logged in through the VNC session. Polling
+// beats failing fast here: the container is expected to come up before anyone
+// is around to log in, and the profile makes this a once-per-deployment step.
+export async function ensureLoggedIn(): Promise<void> {
+  const p = await ensureBrowser();
 
-async function fetchPublic(subreddit: string, limit: number): Promise<Response> {
-  if (!sessionCookie) await primeSession();
-
-  let res = await fetchPublicOnce(subreddit, limit);
-  // If we get blocked, the cookie is likely stale/missing — re-prime once and retry.
-  if (res.status === 403 || res.status === 429) {
-    await primeSession();
-    res = await fetchPublicOnce(subreddit, limit);
+  if (await hasSession()) {
+    log("Reddit session found in browser profile.");
+    return;
   }
-  return res;
-}
 
-async function fetchOAuth(subreddit: string, limit: number): Promise<Response> {
-  const token = await getAccessToken();
-  return fetch(
-    `https://oauth.reddit.com/r/${subreddit}/${config.redditListing}?${listingQuery(limit)}`,
-    {
-      headers: {
-        ...browserHeaders(),
-        Authorization: `Bearer ${token}`,
-      },
+  await p.goto("https://old.reddit.com/login/", { waitUntil: "domcontentloaded" }).catch(() => {});
+  log("=".repeat(72));
+  log("NOT LOGGED IN TO REDDIT. The browser is waiting on the virtual display.");
+  log("From your machine:  ssh -L 5900:127.0.0.1:5900 minty@<homelab>");
+  log("Then point a VNC client at 127.0.0.1:5900 and log in to Reddit.");
+  log(`Waiting up to ${config.browser.loginWaitSeconds}s for the login to complete...`);
+  log("=".repeat(72));
+
+  const deadline = Date.now() + config.browser.loginWaitSeconds * 1000;
+  while (Date.now() < deadline) {
+    await sleep(5000);
+    if (await hasSession()) {
+      log("Reddit login detected. Continuing.");
+      return;
     }
+  }
+  throw new Error(
+    `No Reddit session after ${config.browser.loginWaitSeconds}s. Log in over VNC and restart.`
   );
+}
+
+export async function closeBrowser(): Promise<void> {
+  await context?.close().catch(() => {});
+  context = null;
+  page = null;
+  probePage = null;
 }
 
 export async function fetchNewPosts(subreddit: string, limit: number): Promise<RedditPost[]> {
-  const res = config.reddit.usePublicApi
-    ? await fetchPublic(subreddit, limit)
-    : await fetchOAuth(subreddit, limit);
+  const p = await ensureBrowser();
+  const url = `https://old.reddit.com/r/${subreddit}/${config.redditListing}.json?${listingQuery(limit)}`;
 
-  if (!res.ok) {
-    throw new Error(`Failed to fetch r/${subreddit}: ${res.status} ${await res.text()}`);
+  const res = await p.goto(url, { waitUntil: "domcontentloaded" });
+  if (!res) throw new Error(`No response for r/${subreddit}`);
+
+  // The failure that hid the original outage: Reddit answers a logged-out
+  // request with a 302 to /login, which lands on a 200 HTML page. Checking the
+  // status alone says "ok" and the HTML only fails later, at JSON.parse.
+  const finalUrl = p.url();
+  if (finalUrl.includes("/login")) {
+    throw new Error(`Reddit redirected r/${subreddit} to login — session expired; log in over VNC.`);
   }
 
-  const data = (await res.json()) as {
+  const contentType = (res.headers()["content-type"] ?? "").toLowerCase();
+  if (!res.ok() || !contentType.includes("json")) {
+    throw new Error(
+      `Failed to fetch r/${subreddit}: ${res.status()} content-type=${contentType || "none"} url=${finalUrl}`
+    );
+  }
+
+  const data = JSON.parse(await res.text()) as {
     data: { children: Array<{ data: RedditPost }> };
   };
 

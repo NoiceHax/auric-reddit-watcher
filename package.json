@@ -6,11 +6,13 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "login": "node dist/login.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
-    "pg": "^8.22.0"
+    "pg": "^8.22.0",
+    "playwright": "1.63.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.9",

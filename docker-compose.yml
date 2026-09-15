@@ -1,8 +1,32 @@
 services:
   auric-reddit-watcher:
     build: .
+    container_name: auric-reddit-watcher
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      DISPLAY: ":99"
+      VNC_ENABLE: "true"
+    # Chromium crashes on the default 64MB /dev/shm.
+    shm_size: "1gb"
+    # Give the SIGTERM handler time to close Chrome cleanly, so the profile is
+    # not left holding locks for the next start.
+    stop_grace_period: 30s
     volumes:
       - ./config:/app/config
+      # Named volume, not a bind mount: the Chrome profile is container-owned
+      # state and nothing on the host needs to read it.
+      - browser-profile:/data
+    ports:
+      # Loopback only — the VNC display is reachable solely through an SSH
+      # tunnel (ssh -L 5900:127.0.0.1:5900 minty@homelab), never from the LAN.
+      - "127.0.0.1:5900:5900"
+    networks: [homelab]
+
+volumes:
+  browser-profile:
+
+networks:
+  homelab:
+    external: true

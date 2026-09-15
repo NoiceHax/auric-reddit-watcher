@@ -1,5 +1,5 @@
 import { config } from "./config";
-import { fetchNewPosts } from "./reddit";
+import { fetchNewPosts, ensureLoggedIn, closeBrowser } from "./reddit";
 import { classifyPost } from "./classify";
 import { notifyLead } from "./discord";
 import { initDb, hasSeen, markSeen, isPrimed, markPrimed, upsertLead } from "./db";
@@ -67,29 +67,58 @@ async function pollSubreddit(subreddit: string): Promise<void> {
   }
 }
 
-async function pollAll(): Promise<void> {
-  for (const subreddit of config.subreddits) {
+// When each subreddit is next eligible, keyed by name. Everything starts at 0
+// so the first pass covers the whole list, then each falls into its own cadence.
+const nextDueAt = new Map<string, number>();
+
+async function pollDue(): Promise<void> {
+  const now = Date.now();
+  for (const { name, intervalHours } of config.subreddits) {
+    if ((nextDueAt.get(name) ?? 0) > now) continue;
+
     try {
-      await pollSubreddit(subreddit);
+      await pollSubreddit(name);
     } catch (err) {
-      log(`Error polling r/${subreddit}: ${(err as Error).message}`);
+      log(`Error polling r/${name}: ${(err as Error).message}`);
     }
+    // Scheduled from completion, not from when it came due, so a slow poll
+    // cannot make a subreddit immediately due again.
+    nextDueAt.set(name, Date.now() + intervalHours * 3_600_000);
     await sleep(1000);
   }
 }
 
 async function main(): Promise<void> {
   await initDb();
-  log(`Starting Auric Reddit lead watcher. Watching: ${config.subreddits.join(", ")}`);
-  log(`Poll interval: ${config.pollIntervalSeconds}s`);
+  const byInterval = new Map<number, string[]>();
+  for (const { name, intervalHours } of config.subreddits) {
+    byInterval.set(intervalHours, [...(byInterval.get(intervalHours) ?? []), name]);
+  }
+  log(`Starting Auric Reddit lead watcher. Watching ${config.subreddits.length} subreddits:`);
+  for (const hours of [...byInterval.keys()].sort((a, b) => a - b)) {
+    log(`  every ${hours}h: ${byInterval.get(hours)!.join(", ")}`);
+  }
 
+  // Blocks until the browser profile holds a Reddit session. Without one every
+  // listing request is answered with a redirect to the login page.
+  await ensureLoggedIn();
   while (true) {
-    await pollAll();
-    await sleep(config.pollIntervalSeconds * 1000);
+    await pollDue();
+    await sleep(config.schedulerTickSeconds * 1000);
   }
 }
 
-main().catch((err) => {
+// Close Chrome on the way out, otherwise the persistent profile keeps a lock
+// that makes the next container start fail.
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => {
+    log(`Received ${signal}, shutting down.`);
+    void closeBrowser().finally(() => process.exit(0));
+  });
+}
+
+main().catch(async (err) => {
   console.error("Fatal error:", err);
+  await closeBrowser();
   process.exit(1);
 });

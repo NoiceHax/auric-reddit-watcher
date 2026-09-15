@@ -64,12 +64,52 @@ const TOOL_SCHEMA = {
   },
 };
 
+// Reasoning models emit their chain-of-thought as content and often ignore
+// tool_choice, so the verdict arrives as a JSON object buried in prose — and
+// sometimes preceded by a stray brace. A greedy /\{[\s\S]*\}/ spans from the
+// first brace to the last and captures that garbage, so instead scan every
+// candidate start and keep the last one that actually parses with a verdict.
 function extractJsonObject(text: string): ClassificationResult {
-  const match = text.match(/\{[\s\S]*\}/);
-  if (!match) {
-    throw new Error(`Classifier response contained no JSON object: ${text}`);
+  const candidates: ClassificationResult[] = [];
+
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== "{") continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let j = i; j < text.length; j++) {
+      const ch = text[j];
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = !inString;
+      } else if (!inString && ch === "{") {
+        depth++;
+      } else if (!inString && ch === "}") {
+        depth--;
+        if (depth === 0) {
+          try {
+            const parsed = JSON.parse(text.slice(i, j + 1)) as ClassificationResult;
+            if (typeof parsed?.worthy === "boolean") candidates.push(parsed);
+          } catch {
+            // not valid JSON on its own; keep scanning
+          }
+          break;
+        }
+      }
+    }
   }
-  return JSON.parse(match[0]);
+
+  const verdict = candidates[candidates.length - 1];
+  if (!verdict) {
+    throw new Error(
+      `Classifier returned no parsable verdict (len=${text.length}): ${text.slice(-400)}`
+    );
+  }
+  return { worthy: verdict.worthy, reason: verdict.reason ?? "(no reason given)" };
 }
 
 export async function classifyPost(post: RedditPost): Promise<ClassificationResult> {
@@ -84,17 +124,19 @@ Body: ${post.selftext?.slice(0, 2000) || "(no body / link post)"}`;
 
   let res: Response;
   try {
-    res = await fetch(`${config.nvidia.baseUrl}/chat/completions`, {
+    res = await fetch(`${config.llm.baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${config.nvidia.apiKey}`,
+        // llm-gateway maps this token to the "auric" project in projects.yml,
+        // which owns the model priority list and the shared NVIDIA key pool.
+        Authorization: `Bearer ${config.llm.token}`,
         "content-type": "application/json",
       },
       signal: controller.signal,
       body: JSON.stringify({
-        model: config.classifierModel,
+        ...(config.classifierModel ? { model: config.classifierModel } : {}),
         temperature: 0.2,
-        max_tokens: 300,
+        max_tokens: config.classifyMaxTokens,
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: userContent },
@@ -106,7 +148,8 @@ Body: ${post.selftext?.slice(0, 2000) || "(no body / link post)"}`;
   } catch (err) {
     if ((err as Error).name === "AbortError") {
       throw new Error(
-        `Classification timed out after ${config.classifyTimeoutMs}ms (model: ${config.classifierModel})`
+        `Classification timed out after ${config.classifyTimeoutMs}ms ` +
+          `(gateway: ${config.llm.baseUrl}, model: ${config.classifierModel || "gateway-ranked"})`
       );
     }
     throw err;
